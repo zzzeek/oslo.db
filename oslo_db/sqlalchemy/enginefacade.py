@@ -9,13 +9,16 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+from __future__ import annotations
 
 import contextlib
+from enum import Enum
 import functools
 import inspect
 import operator
 import threading
 import warnings
+from typing import TYPE_CHECKING
 
 import debtcollector.moves
 import debtcollector.removals
@@ -30,40 +33,48 @@ from oslo_db.sqlalchemy import orm
 from oslo_db import warning
 
 
-class _symbol(object):
-    """represent a fixed symbol."""
+if TYPE_CHECKING:
+    from typing import Any
+    import asyncio
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.ext.asyncio import AsyncEngine
+    from typing import Self
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    __slots__ = 'name',
+class _FacadeSymbols(Enum):
+    _ASYNC_READER = 1
+    """Represent the transaction state of "async reader".
 
-    def __init__(self, name):
-        self.name = name
+    This state indicates that the transaction is a read-only and is
+    safe to use on an asynchronously updated slave database.
+    """
 
-    def __repr__(self):
-        return "symbol(%r)" % self.name
+    _READER = 2
+    """Represent the transaction state of "reader".
 
+    This state indicates that the transaction is a read-only and is
+    only safe to use on a synchronously updated slave database; otherwise
+    the master database should be used.
+    """
 
-_ASYNC_READER = _symbol('ASYNC_READER')
-"""Represent the transaction state of "async reader".
+    _WRITER = 3
+    """Represent the transaction state of "writer".
 
-This state indicates that the transaction is a read-only and is
-safe to use on an asynchronously updated slave database.
-"""
-
-_READER = _symbol('READER')
-"""Represent the transaction state of "reader".
-
-This state indicates that the transaction is a read-only and is
-only safe to use on a synchronously updated slave database; otherwise
-the master database should be used.
-"""
+    This state indicates that the transaction writes data and
+    should be directed at the master database.
+    """
 
 
-_WRITER = _symbol('WRITER')
-"""Represent the transaction state of "writer".
+_ASYNC_READER, _READER, _WRITER = (
+    _FacadeSymbols._ASYNC_READER,
+    _FacadeSymbols._READER,
+    _FacadeSymbols._WRITER,
+)
 
-This state indicates that the transaction writes data and
-should be directed at the master database.
-"""
+class _NotSet(Enum):
+    NOTSET = 1
+
 
 
 class _Default:
@@ -77,7 +88,7 @@ class _Default:
 
     __slots__ = 'value',
 
-    _notset = _symbol("NOTSET")
+    _notset = _NotSet.NOTSET
 
     def __init__(self, value=_notset):
         self.value = value
@@ -142,18 +153,23 @@ class AlreadyStartedError(TypeError):
     """
 
 
-class _TransactionFactory:
-    """A factory for :class:`._TransactionContext` objects.
+class _AbstractTransactionFactory:
+    """Abstract base for _TransactionFactory.
 
-    By default, there is just one of these, set up
-    based on CONF, however instance-level :class:`._TransactionFactory`
-    objects can be made, as is the case with the
-    :class:`._TestTransactionFactory` subclass used by the oslo.db test suite.
     """
+
+    _start_lock: threading.Lock | asyncio.Lock
+    _writer_engine: Engine | AsyncEngine
+    _reader_engine: Engine | AsyncEngine
+    _writer_maker:  sessionmaker | async_sessionmaker
+    _reader_maker:  sessionmaker | async_sessionmaker
+
     def __init__(self):
         self._url_cfg = {
             'connection': _Default(),
             'slave_connection': _Default(),
+            'asyncio_connection': _Default(),
+            'asyncio_slave_connection': _Default(),
         }
         self._engine_cfg = {
             'sqlite_fk': _Default(False),
@@ -200,9 +216,12 @@ class _TransactionFactory:
 
         self._started = False
         self._legacy_facade = None
-        self._start_lock = threading.Lock()
+        self._start_lock = self._make_lock()
 
-    def configure_defaults(self, **kw):
+    def _make_lock(self) -> threading.Lock | asyncio.Lock:
+        raise NotImplementedError()
+
+    def configure_defaults(self, **kw: Any) -> None:
         """Apply default configurational options.
 
         This method can only be called before any specific
@@ -225,6 +244,8 @@ class _TransactionFactory:
 
         :param connection: database URL
         :param slave_connection: database URL
+        :param asyncio_connection: database URL
+        :param asyncio_slave_connection: database URL
         :param sqlite_fk: whether to enable SQLite foreign key pragma; default
             False
         :param mysql_sql_mode: MySQL SQL mode, defaults to TRADITIONAL
@@ -290,7 +311,7 @@ class _TransactionFactory:
         """
         self._configure(True, kw)
 
-    def configure(self, **kw):
+    def configure(self, **kw: Any) -> None:
         """Apply configurational options.
 
         This method can only be called before any specific
@@ -337,22 +358,7 @@ class _TransactionFactory:
                 warning.NotSupportedWarning
             )
 
-    def get_legacy_facade(self):
-        """Return a :class:`.LegacyEngineFacade` for this factory.
-
-        This facade will make use of the same engine and sessionmaker
-        as this factory, however will not share the same transaction context;
-        the legacy facade continues to work the old way of returning
-        a new Session each time get_session() is called.
-        """
-        if not self._legacy_facade:
-            self._legacy_facade = LegacyEngineFacade(None, _factory=self)
-            if not self._started:
-                self._start()
-
-        return self._legacy_facade
-
-    def get_writer_engine(self):
+    def get_writer_engine(self) -> Engine | AsyncEngine:
         """Return the writer engine for this factory.
 
         Implies start.
@@ -361,7 +367,7 @@ class _TransactionFactory:
             self._start()
         return self._writer_engine
 
-    def get_reader_engine(self):
+    def get_reader_engine(self) -> Engine | AsyncEngine:
         """Return the reader engine for this factory.
 
         Implies start.
@@ -370,7 +376,7 @@ class _TransactionFactory:
             self._start()
         return self._reader_engine
 
-    def get_writer_maker(self):
+    def get_writer_maker(self) -> sessionmaker | async_sessionmaker:
         """Return the writer sessionmaker for this factory.
 
         Implies start.
@@ -379,7 +385,7 @@ class _TransactionFactory:
             self._start()
         return self._writer_maker
 
-    def get_reader_maker(self):
+    def get_reader_maker(self) -> sessionmaker | async_sessionmaker:
         """Return the reader sessionmaker for this factory.
 
         Implies start.
@@ -387,6 +393,16 @@ class _TransactionFactory:
         if not self._started:
             self._start()
         return self._reader_maker
+
+    def _create_factory_copy(self) -> Self:
+        factory = self.__class__()
+        factory._url_cfg.update(self._url_cfg)
+        factory._engine_cfg.update(self._engine_cfg)
+        factory._maker_cfg.update(self._maker_cfg)
+        factory._transaction_ctx_cfg.update(self._transaction_ctx_cfg)
+        factory._facade_cfg.update(self._facade_cfg)
+        return factory
+
 
     def _create_connection(self, mode):
         if not self._started:
@@ -415,15 +431,6 @@ class _TransactionFactory:
         else:
             return self._writer_maker(**kw)
 
-    def _create_factory_copy(self):
-        factory = _TransactionFactory()
-        factory._url_cfg.update(self._url_cfg)
-        factory._engine_cfg.update(self._engine_cfg)
-        factory._maker_cfg.update(self._maker_cfg)
-        factory._transaction_ctx_cfg.update(self._transaction_ctx_cfg)
-        factory._facade_cfg.update(self._facade_cfg)
-        return factory
-
     def _args_for_conf(self, default_cfg, conf):
         if conf is None:
             return {
@@ -447,16 +454,6 @@ class _TransactionFactory:
     def _maker_args_for_conf(self, conf):
         maker_args = self._args_for_conf(self._maker_cfg, conf)
         return maker_args
-
-    def dispose_pool(self):
-        """Call engine.pool.dispose() on underlying Engine objects."""
-        with self._start_lock:
-            if not self._started:
-                return
-
-            self._writer_engine.pool.dispose()
-            if self._reader_engine is not self._writer_engine:
-                self._reader_engine.pool.dispose()
 
     @property
     def is_started(self):
@@ -509,6 +506,89 @@ class _TransactionFactory:
             # we try the whole thing again and report errors
             # correctly
             self._started = True
+
+
+class _TransactionFactory(_AbstractTransactionFactory):
+    """A factory for :class:`._TransactionContext` objects.
+
+    By default, there is just one of these, set up
+    based on CONF, however instance-level :class:`._TransactionFactory`
+    objects can be made, as is the case with the
+    :class:`._TestTransactionFactory` subclass used by the oslo.db test suite.
+    """
+
+    _start_lock: threading.Lock
+    _writer_engine: Engine
+    _reader_engine: Engine
+    _writer_maker:  sessionmaker
+    _reader_maker:  sessionmaker
+
+    def _make_lock(self) -> threading.Lock:
+        return threading.Lock()
+
+    if TYPE_CHECKING:
+        def get_writer_engine(self) -> Engine:
+            """Return the writer engine for this factory.
+
+            Implies start.
+            """
+            ...
+
+        def get_reader_engine(self) -> Engine:
+            """Return the reader engine for this factory.
+
+            Implies start.
+            """
+            ...
+
+        def get_writer_maker(self) -> sessionmaker:
+            """Return the writer sessionmaker for this factory.
+
+            Implies start.
+            """
+            ...
+
+        def get_reader_maker(self) -> sessionmaker:
+            """Return the reader sessionmaker for this factory.
+
+            Implies start.
+            """
+            ...
+
+    def _create_factory_copy(self):
+        factory = _TransactionFactory()
+        factory._url_cfg.update(self._url_cfg)
+        factory._engine_cfg.update(self._engine_cfg)
+        factory._maker_cfg.update(self._maker_cfg)
+        factory._transaction_ctx_cfg.update(self._transaction_ctx_cfg)
+        factory._facade_cfg.update(self._facade_cfg)
+        return factory
+
+    def get_legacy_facade(self):
+        """Return a :class:`.LegacyEngineFacade` for this factory.
+
+        This facade will make use of the same engine and sessionmaker
+        as this factory, however will not share the same transaction context;
+        the legacy facade continues to work the old way of returning
+        a new Session each time get_session() is called.
+        """
+        if not self._legacy_facade:
+            self._legacy_facade = LegacyEngineFacade(None, _factory=self)
+            if not self._started:
+                self._start()
+
+        return self._legacy_facade
+
+
+    def dispose_pool(self):
+        """Call engine.pool.dispose() on underlying Engine objects."""
+        with self._start_lock:
+            if not self._started:
+                return
+
+            self._writer_engine.pool.dispose()
+            if self._reader_engine is not self._writer_engine:
+                self._reader_engine.pool.dispose()
 
     def _setup_for_connection(
         self, sql_connection, engine_kwargs, maker_kwargs,

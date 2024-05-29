@@ -146,6 +146,10 @@ def _vet_url(url):
             )
 
 
+def _create_engine(url, **engine_args):
+    engine = sqlalchemy.create_engine(url, **engine_args)
+    return engine, engine
+
 @debtcollector.renames.renamed_kwarg(
     'idle_timeout',
     'connection_recycle_time',
@@ -159,7 +163,8 @@ def create_engine(sql_connection, sqlite_fk=False, mysql_sql_mode=None,
                   connection_trace=False, max_retries=10, retry_interval=10,
                   thread_checkin=True, logging_name=None,
                   json_serializer=None,
-                  json_deserializer=None, connection_parameters=None):
+                  json_deserializer=None, connection_parameters=None,
+                  _engine_target=_create_engine):
     """Return a new SQLAlchemy engine."""
 
     url = utils.make_url(sql_connection)
@@ -191,10 +196,10 @@ def create_engine(sql_connection, sqlite_fk=False, mysql_sql_mode=None,
         )
     )
 
-    engine = sqlalchemy.create_engine(url, **engine_args)
+    engine, engine_event_target = _engine_target(url, **engine_args)
 
     _init_events(
-        engine,
+        engine_event_target,
         mysql_sql_mode=mysql_sql_mode,
         mysql_wsrep_sync_wait=mysql_wsrep_sync_wait,
         sqlite_synchronous=sqlite_synchronous,
@@ -204,18 +209,18 @@ def create_engine(sql_connection, sqlite_fk=False, mysql_sql_mode=None,
     )
 
     # register alternate exception handler
-    exc_filters.register_engine(engine)
+    exc_filters.register_engine(engine_event_target)
 
     if not _native_pre_ping:
         # register engine connect handler.
 
-        event.listen(engine, "engine_connect", _connect_ping_listener)
+        event.listen(engine_event_target, "engine_connect", _connect_ping_listener)
 
     # initial connect + test
     # NOTE(viktors): the current implementation of _test_connection()
     #                does nothing, if max_retries == 0, so we can skip it
     if max_retries:
-        test_conn = _test_connection(engine, max_retries, retry_interval)
+        test_conn = _test_connection(engine_event_target, max_retries, retry_interval)
         test_conn.close()
 
     return engine
