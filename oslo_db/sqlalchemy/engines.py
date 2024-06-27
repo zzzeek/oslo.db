@@ -150,6 +150,29 @@ def _create_engine(url, **engine_args):
     engine = sqlalchemy.create_engine(url, **engine_args)
     return engine, engine
 
+def _test_connection(engine, max_retries, retry_interval):
+    if max_retries == -1:
+        attempts = itertools.count()
+    else:
+        attempts = range(max_retries)
+    # See: http://legacy.python.org/dev/peps/pep-3110/#semantic-changes for
+    # why we are not using 'de' directly (it can be removed from the local
+    # scope).
+    de_ref = None
+    for attempt in attempts:
+        try:
+            conn = engine.connect()
+        except exception.DBConnectionError as de:
+            msg = 'SQL connection failed. %s attempts left.'
+            LOG.warning(msg, max_retries - attempt)
+            time.sleep(retry_interval)
+            de_ref = de
+        else:
+            conn.close()
+    else:
+        if de_ref is not None:
+            raise de_ref
+
 @debtcollector.renames.renamed_kwarg(
     'idle_timeout',
     'connection_recycle_time',
@@ -164,7 +187,8 @@ def create_engine(sql_connection, sqlite_fk=False, mysql_sql_mode=None,
                   thread_checkin=True, logging_name=None,
                   json_serializer=None,
                   json_deserializer=None, connection_parameters=None,
-                  _engine_target=_create_engine):
+                  _engine_target=_create_engine,
+                  _test_connection=_test_connection):
     """Return a new SQLAlchemy engine."""
 
     url = utils.make_url(sql_connection)
@@ -220,8 +244,7 @@ def create_engine(sql_connection, sqlite_fk=False, mysql_sql_mode=None,
     # NOTE(viktors): the current implementation of _test_connection()
     #                does nothing, if max_retries == 0, so we can skip it
     if max_retries:
-        test_conn = _test_connection(engine_event_target, max_retries, retry_interval)
-        test_conn.close()
+        _test_connection(engine_event_target, max_retries, retry_interval)
 
     return engine
 
@@ -400,28 +423,6 @@ def _init_events(engine, sqlite_synchronous=True, sqlite_fk=False, **kw):
     def _sqlite_end_transaction(conn):
         # remove transactional marker
         conn.info.pop('in_transaction', None)
-
-
-def _test_connection(engine, max_retries, retry_interval):
-    if max_retries == -1:
-        attempts = itertools.count()
-    else:
-        attempts = range(max_retries)
-    # See: http://legacy.python.org/dev/peps/pep-3110/#semantic-changes for
-    # why we are not using 'de' directly (it can be removed from the local
-    # scope).
-    de_ref = None
-    for attempt in attempts:
-        try:
-            return engine.connect()
-        except exception.DBConnectionError as de:
-            msg = 'SQL connection failed. %s attempts left.'
-            LOG.warning(msg, max_retries - attempt)
-            time.sleep(retry_interval)
-            de_ref = de
-    else:
-        if de_ref is not None:
-            raise de_ref
 
 
 def _add_process_guards(engine):

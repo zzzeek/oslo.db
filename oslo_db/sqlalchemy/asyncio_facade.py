@@ -1,11 +1,62 @@
-from .enginefacade import _AbstractTransactionFactory
+from __future__ import annotations
+
+from .enginefacade import _AbstractTransactionFactory, _TransactionContextManager, _TransactionContext
+import contextvars
+import contextlib
+import logging
+
+from . import enginefacade as _sync_facade
 import asyncio
 from oslo_db import exception
 from oslo_db import options
 from oslo_db.sqlalchemy import engines
 from oslo_db.sqlalchemy import orm
+import itertools
 from oslo_db import warning
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from typing import TYPE_CHECKING
+from typing import Optional, Tuple
+from sqlalchemy.util.concurrency import await_only, greenlet_spawn
+
+
+LOG = logging.getLogger(__name__)
+
+def _create_async_engine(url, **engine_args):
+    async_engine = create_async_engine(url, **engine_args)
+    return async_engine, async_engine.engine
+
+def _test_async_connection(engine, max_retries, retry_interval):
+    if max_retries == -1:
+        attempts = itertools.count()
+    else:
+        attempts = range(max_retries)
+    # See: http://legacy.python.org/dev/peps/pep-3110/#semantic-changes for
+    # why we are not using 'de' directly (it can be removed from the local
+    # scope).
+    de_ref = None
+    for attempt in attempts:
+        try:
+            conn = engine.connect()
+        except exception.DBConnectionError as de:
+            msg = 'SQL connection failed. %s attempts left.'
+            LOG.warning(msg, max_retries - attempt)
+            await_only(asyncio.sleep(retry_interval))
+            de_ref = de
+        else:
+            conn.close()
+    else:
+        if de_ref is not None:
+            raise de_ref
+
+class _GreenletAdaptedLock:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+
+    def __enter__(self):
+        await_only(self._lock.acquire())
+
+    def __exit__(self, *arg, **kw):
+        self._lock.release()
 
 class _AsyncioTransactionFactory(_AbstractTransactionFactory):
     """A factory for :class:`._AsyncioTransactionContext` objects.
@@ -16,13 +67,15 @@ class _AsyncioTransactionFactory(_AbstractTransactionFactory):
     :class:`._TestTransactionFactory` subclass used by the oslo.db test suite.
     """
 
-    _start_lock: asyncio.Lock
+    _start_lock: _GreenletAdaptedLock
 
     _writer_engine: AsyncEngine
     _reader_engine: AsyncEngine
+    _writer_maker:  async_sessionmaker
+    _reader_maker:  async_sessionmaker
 
     def _make_lock(self):
-        return asyncio.Lock()
+        return _GreenletAdaptedLock()
 
     if TYPE_CHECKING:
         def get_writer_engine(self) -> AsyncEngine:
@@ -69,9 +122,253 @@ class _AsyncioTransactionFactory(_AbstractTransactionFactory):
         if sql_connection is None:
             raise exception.CantStartEngineError(
                 "No sql_connection parameter is established")
+
         engine = engines.create_engine(
-            sql_connection=sql_connection, **engine_kwargs)
+            sql_connection=sql_connection,
+            _engine_target=_create_async_engine,
+            _test_connection=_test_async_connection,
+            **engine_kwargs)
         for hook in self._facade_cfg['on_engine_create']:
             hook(engine)
         sessionmaker = orm.get_maker(engine=engine, **maker_kwargs)
         return engine, sessionmaker
+
+    async def _create_async_connection(self, mode):
+        if not self._started:
+            await greenlet_spawn(self._start)
+        if mode is _sync_facade._WRITER:
+            return await self._writer_engine.connect()
+        elif mode is _sync_facade._ASYNC_READER or \
+                (mode is _sync_facade._READER and not self.synchronous_reader):
+            return await self._reader_engine.connect()
+        else:
+            return await self._writer_engine.connect()
+
+    async def _create_async_session(self, mode, bind=None):
+        if not self._started:
+            self._start()
+        kw = {}
+        # don't pass 'bind' if bind is None; the sessionmaker
+        # already has a bind to the engine.
+        if bind:
+            kw['bind'] = bind
+        if mode is _sync_facade._WRITER:
+            return await self._writer_maker(**kw)
+        elif mode is _sync_facade._ASYNC_READER or \
+                (mode is _sync_facade._READER and not self.synchronous_reader):
+            return await self._reader_maker(**kw)
+        else:
+            return await self._writer_maker(**kw)
+
+class _TransactionContextContextVar:
+    __slots__ = "_context_vars",
+
+    def __init__(self):
+        object.__setattr__(self, "_context_vars", {})
+
+    def _get_context_var(self, key):
+        if key not in self._context_vars:
+            self._context_vars[key] = var = contextvars.ContextVar(key)
+        else:
+            var = self._context_vars[key]
+        return var
+
+    def __getattr__(self, key):
+        context_var = self._get_context_var(key)
+        try:
+            return context_var.get()
+        except LookupError as le:
+            raise AttributeError(key) from le
+
+
+
+    def __setattr__(self, key, value):
+        context_var = self._get_context_var(key)
+        context_var.set(value)
+
+    def __delattr__(self, key):
+        context_var = self._get_context_var(key)
+        context_var.set(None)
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __reduce__(self):
+        return _TransactionContextContextVar, ()
+
+def _transaction_contexts_by_coroutine(context):
+    transaction_contexts_by_coroutine = getattr(
+        context, '_asyncio_facade_context', None)
+    if transaction_contexts_by_coroutine is None:
+        transaction_contexts_by_coroutine = \
+            context._asyncio_facade_context = _TransactionContextContextVar()
+
+    return transaction_contexts_by_coroutine
+
+class _AsyncTransactionContextManager(_TransactionContextManager):
+
+    @contextlib.asynccontextmanager
+    async def _transaction_scope(self, context):
+        transaction_contexts_by_coroutine = \
+            _transaction_contexts_by_coroutine(context)
+
+        current, restore = self._transaction_scope_impl(
+            transaction_contexts_by_coroutine
+        )
+
+        try:
+            if self._mode is not None:
+                async with current._produce_asyncio_block(
+                    mode=self._mode,
+                    connection=self._connection,
+                    savepoint=self._savepoint,
+                    allow_async=self._allow_async,
+                    context=context) as resource:
+                    yield resource
+            else:
+                yield
+        finally:
+            if restore is None:
+                del transaction_contexts_by_coroutine.current
+            elif current is not restore:
+                transaction_contexts_by_coroutine.current = restore
+
+    if TYPE_CHECKING:
+        def _transaction_scope_impl(
+                self, transaction_contexts_concurrent)  -> Tuple[
+            _TransactionContext,
+            Optional[_TransactionContext]
+        ]:
+            ...
+
+    def _create_root_factory(self):
+        return _AsyncioTransactionFactory()
+
+    def _create_transaction_context(self, use_factory, global_factory):
+        return _AsyncTransactionContext(use_factory, global_factory=global_factory)
+
+
+class _AsyncTransactionContext(_TransactionContext):
+
+    async def _end_async_connection_transaction(self, transaction):
+        if self.mode is _sync_facade._WRITER:
+            await transaction.commit()
+        else:
+            await transaction.rollback()
+
+    def _produce_asyncio_block(self, mode, connection, savepoint, allow_async=False,
+                       context=None):
+        if mode is _sync_facade._WRITER:
+            self._writer()
+        elif mode is _sync_facade._ASYNC_READER:
+            self._async_reader()
+        else:
+            self._reader(allow_async)
+        if connection:
+            return self._async_connection(savepoint, context=context)
+        else:
+            return self._async_session(savepoint, context=context)
+
+    @contextlib.asynccontextmanager
+    async def _async_connection(self, savepoint=False, context=None):
+        if self.connection is None:
+            try:
+                if self.session is not None:
+                    # use existing session, which is outer to us
+                    self.connection = await self.session.connection()
+                    if savepoint:
+                        with self.connection.begin_nested(), \
+                                self._add_context(self.connection, context):
+                            yield self.connection
+                    else:
+                        with self._add_context(self.connection, context):
+                            yield self.connection
+                else:
+                    # is outermost
+                    self.connection = await self.factory._create_async_connection(
+                        mode=self.mode)
+                    self.transaction = await self.connection.begin()
+                    try:
+                        with self._add_context(self.connection, context):
+                            yield self.connection
+                        await self._end_async_connection_transaction(self.transaction)
+                    except Exception:
+                        await self.transaction.rollback()
+                        # TODO(zzzeek) do we need save_and_reraise() here,
+                        # or do newer eventlets not have issues?  we are using
+                        # raw "raise" in many other places in oslo.db already
+                        raise
+                    finally:
+                        self.transaction = None
+                        await self.connection.close()
+            finally:
+                self.connection = None
+
+        else:
+            # use existing connection, which is outer to us
+            if savepoint:
+                with self.connection.begin_nested(), \
+                        self._add_context(self.connection, context):
+                    yield self.connection
+            else:
+                with self._add_context(self.connection, context):
+                    yield self.connection
+
+    @contextlib.asynccontextmanager
+    async def _async_session(self, savepoint=False, context=None):
+        if self.session is None:
+            self.session = self.factory._create_session(
+                bind=self.connection, mode=self.mode)
+            try:
+                self.session.begin()
+                with self._add_context(self.session, context):
+                    yield self.session
+                self._end_session_transaction(self.session)
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    self.session.rollback()
+            finally:
+                self.session.close()
+                self.session = None
+        else:
+            # use existing session, which is outer to us
+            if savepoint:
+                with self.session.begin_nested():
+                    with self._add_context(self.session, context):
+                        yield self.session
+            else:
+                with self._add_context(self.session, context):
+                    yield self.session
+                if self.flush_on_subtransaction:
+                    self.session.flush()
+
+def configure(**kw):
+    """Apply configurational options to the global factory.
+
+    This method can only be called before any specific transaction-beginning
+    methods have been called.
+
+    .. seealso::
+
+        :meth:`._TransactionFactory.configure`
+
+    """
+    _async_context_manager._factory.configure(**kw)
+
+
+_async_context_manager = _AsyncTransactionContextManager(_is_global_manager=True)
+"""default context manager."""
+
+
+def transaction_context():
+    """Construct a local transaction context.
+
+    """
+    return _TransactionContextManager()
+
+reader = _async_context_manager.reader
+"""The global 'reader' starting point."""
+
+
+writer = _async_context_manager.writer
+"""The global 'writer' starting point."""

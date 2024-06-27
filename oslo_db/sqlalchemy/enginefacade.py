@@ -19,6 +19,7 @@ import operator
 import threading
 import warnings
 from typing import TYPE_CHECKING
+from typing import Tuple, Optional
 
 import debtcollector.moves
 import debtcollector.removals
@@ -219,6 +220,11 @@ class _AbstractTransactionFactory:
         self._start_lock = self._make_lock()
 
     def _make_lock(self) -> threading.Lock | asyncio.Lock:
+        raise NotImplementedError()
+
+    def _setup_for_connection(
+        self, sql_connection, engine_kwargs, maker_kwargs,
+    ):
         raise NotImplementedError()
 
     def configure_defaults(self, **kw: Any) -> None:
@@ -647,7 +653,7 @@ class _TestTransactionFactory(_TransactionFactory):
         _context_manager._root_factory = self.existing_factory
 
 
-class _TransactionContext(object):
+class _TransactionContext:
     """Represent a single database transaction in progress."""
 
     def __init__(self, factory, global_factory=None):
@@ -813,7 +819,7 @@ class _TransactionContextTLocal(threading.local):
         return _TransactionContextTLocal, ()
 
 
-class _TransactionContextManager(object):
+class _TransactionContextManager:
     """Provide context-management and decorator patterns for transactions.
 
     This object integrates user-defined "context" objects with the
@@ -834,7 +840,7 @@ class _TransactionContextManager(object):
 
         if root is None:
             self._root = self
-            self._root_factory = _TransactionFactory()
+            self._root_factory = self._create_root_factory()
         else:
             self._root = root
 
@@ -848,6 +854,12 @@ class _TransactionContextManager(object):
                 "setting savepoint and independent makes no sense.")
         self._connection = connection
         self._allow_async = allow_async
+
+    def _create_root_factory(self):
+        return _TransactionFactory()
+
+    def _create_transaction_context(self, use_factory, global_factory):
+        return _TransactionContext(use_factory, global_factory=global_factory)
 
     @property
     def _factory(self):
@@ -1086,16 +1098,43 @@ class _TransactionContextManager(object):
             "connection": self._connection
         }
         default_kw.update(kw)
-        return _TransactionContextManager(root=self._root, **default_kw)
+        return self.__class__(root=self._root, **default_kw)
 
     @contextlib.contextmanager
     def _transaction_scope(self, context):
-        new_transaction = self._independent
         transaction_contexts_by_thread = \
             _transaction_contexts_by_thread(context)
 
+        current, restore = self._transaction_scope_impl(
+            transaction_contexts_by_thread
+        )
+
+        try:
+            if self._mode is not None:
+                with current._produce_block(
+                    mode=self._mode,
+                    connection=self._connection,
+                    savepoint=self._savepoint,
+                    allow_async=self._allow_async,
+                    context=context) as resource:
+                    yield resource
+            else:
+                yield
+        finally:
+            if restore is None:
+                del transaction_contexts_by_thread.current
+            elif current is not restore:
+                transaction_contexts_by_thread.current = restore
+
+    def _transaction_scope_impl(self, transaction_contexts_concurrent) -> Tuple[
+        _TransactionContext,
+        Optional[_TransactionContext]
+    ]:
+
+        new_transaction = self._independent
+
         current = restore = getattr(
-            transaction_contexts_by_thread, "current", None)
+            transaction_contexts_concurrent, "current", None)
 
         use_factory = self._factory
         global_factory = None
@@ -1114,25 +1153,10 @@ class _TransactionContextManager(object):
             current = None
 
         if current is None:
-            current = transaction_contexts_by_thread.current = \
-                _TransactionContext(use_factory, global_factory=global_factory)
+            current = transaction_contexts_concurrent.current = \
+                self._create_transaction_context(use_factory, global_factory=global_factory)
 
-        try:
-            if self._mode is not None:
-                with current._produce_block(
-                    mode=self._mode,
-                    connection=self._connection,
-                    savepoint=self._savepoint,
-                    allow_async=self._allow_async,
-                    context=context) as resource:
-                    yield resource
-            else:
-                yield
-        finally:
-            if restore is None:
-                del transaction_contexts_by_thread.current
-            elif current is not restore:
-                transaction_contexts_by_thread.current = restore
+        return current, restore
 
 
 @property
