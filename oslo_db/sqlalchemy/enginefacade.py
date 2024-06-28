@@ -18,8 +18,8 @@ import inspect
 import operator
 import threading
 import warnings
-from typing import TYPE_CHECKING
-from typing import Tuple, Optional
+from typing import TYPE_CHECKING, Iterator, overload, ContextManager
+from typing import Tuple, Optional, Protocol, Union, Generic, Literal
 
 import debtcollector.moves
 import debtcollector.removals
@@ -37,11 +37,13 @@ from oslo_db import warning
 if TYPE_CHECKING:
     from typing import Any
     import asyncio
-    from sqlalchemy.engine import Engine
+    from sqlalchemy.engine import Engine, Connection
+    from sqlalchemy.orm import Session
     from sqlalchemy.ext.asyncio import AsyncEngine
     from typing import Self
     from sqlalchemy.orm import sessionmaker
     from sqlalchemy.ext.asyncio import async_sessionmaker
+    from sqlalchemy.ext.asyncio import AsyncSession, AsyncConnection
 
 class _FacadeSymbols(Enum):
     _ASYNC_READER = 1
@@ -154,12 +156,19 @@ class AlreadyStartedError(TypeError):
     """
 
 
+class _EnterableLock(Protocol):
+    def __enter__(self):
+        ...
+
+    def __exit__(self, *arg, **kw):
+        ...
+
 class _AbstractTransactionFactory:
     """Abstract base for _TransactionFactory.
 
     """
 
-    _start_lock: threading.Lock | asyncio.Lock
+    _start_lock: _EnterableLock
     _writer_engine: Engine | AsyncEngine
     _reader_engine: Engine | AsyncEngine
     _writer_maker:  sessionmaker | async_sessionmaker
@@ -219,7 +228,7 @@ class _AbstractTransactionFactory:
         self._legacy_facade = None
         self._start_lock = self._make_lock()
 
-    def _make_lock(self) -> threading.Lock | asyncio.Lock:
+    def _make_lock(self) -> _EnterableLock:
         raise NotImplementedError()
 
     def _setup_for_connection(
@@ -653,7 +662,7 @@ class _TestTransactionFactory(_TransactionFactory):
         _context_manager._root_factory = self.existing_factory
 
 
-class _TransactionContext:
+class _AbstractTransactionContext:
     """Represent a single database transaction in progress."""
 
     def __init__(self, factory, global_factory=None):
@@ -675,6 +684,70 @@ class _TransactionContext:
         kw = self.factory._transaction_ctx_cfg
         self.rollback_reader_sessions = kw['rollback_reader_sessions']
         self.flush_on_subtransaction = kw['flush_on_subtransaction']
+
+    @contextlib.contextmanager
+    def _add_context(self, connection, context):
+        restore_context = connection.info.get('using_context')
+        connection.info['using_context'] = context
+        yield connection
+        connection.info['using_context'] = restore_context
+
+    def _writer(self):
+        if self.mode is None:
+            self.mode = _WRITER
+        elif self.mode is _READER:
+            raise TypeError(
+                "Can't upgrade a READER transaction "
+                "to a WRITER mid-transaction")
+        elif self.mode is _ASYNC_READER:
+            raise TypeError(
+                "Can't upgrade an ASYNC_READER transaction "
+                "to a WRITER mid-transaction")
+
+    def _reader(self, allow_async=False):
+        if self.mode is None:
+            self.mode = _READER
+        elif self.mode is _ASYNC_READER and not allow_async:
+            raise TypeError(
+                "Can't upgrade an ASYNC_READER transaction "
+                "to a READER mid-transaction")
+
+    def _async_reader(self):
+        if self.mode is None:
+            self.mode = _ASYNC_READER
+
+
+class _TransactionContext(_AbstractTransactionContext):
+    def _end_session_transaction(self, session):
+        if self.mode is _WRITER:
+            session.commit()
+        elif self.rollback_reader_sessions:
+            session.rollback()
+        # In the absence of calling session.rollback(),
+        # the next call is session.close().  This releases all
+        # objects from the session into the detached state, and
+        # releases the connection as well; the connection when returned
+        # to the pool is either rolled back in any case, or closed fully.
+
+    def _end_connection_transaction(self, transaction):
+        if self.mode is _WRITER:
+            transaction.commit()
+        else:
+            transaction.rollback()
+
+    def _produce_block(self, mode, connection, savepoint, allow_async=False,
+                       context=None):
+        if mode is _WRITER:
+            self._writer()
+        elif mode is _ASYNC_READER:
+            self._async_reader()
+        else:
+            self._reader(allow_async)
+        if connection:
+            return self._connection(savepoint, context=context)
+        else:
+            return self._session(savepoint, context=context)
+
 
     @contextlib.contextmanager
     def _connection(self, savepoint=False, context=None):
@@ -749,67 +822,6 @@ class _TransactionContext:
                 if self.flush_on_subtransaction:
                     self.session.flush()
 
-    @contextlib.contextmanager
-    def _add_context(self, connection, context):
-        restore_context = connection.info.get('using_context')
-        connection.info['using_context'] = context
-        yield connection
-        connection.info['using_context'] = restore_context
-
-    def _end_session_transaction(self, session):
-        if self.mode is _WRITER:
-            session.commit()
-        elif self.rollback_reader_sessions:
-            session.rollback()
-        # In the absence of calling session.rollback(),
-        # the next call is session.close().  This releases all
-        # objects from the session into the detached state, and
-        # releases the connection as well; the connection when returned
-        # to the pool is either rolled back in any case, or closed fully.
-
-    def _end_connection_transaction(self, transaction):
-        if self.mode is _WRITER:
-            transaction.commit()
-        else:
-            transaction.rollback()
-
-    def _produce_block(self, mode, connection, savepoint, allow_async=False,
-                       context=None):
-        if mode is _WRITER:
-            self._writer()
-        elif mode is _ASYNC_READER:
-            self._async_reader()
-        else:
-            self._reader(allow_async)
-        if connection:
-            return self._connection(savepoint, context=context)
-        else:
-            return self._session(savepoint, context=context)
-
-    def _writer(self):
-        if self.mode is None:
-            self.mode = _WRITER
-        elif self.mode is _READER:
-            raise TypeError(
-                "Can't upgrade a READER transaction "
-                "to a WRITER mid-transaction")
-        elif self.mode is _ASYNC_READER:
-            raise TypeError(
-                "Can't upgrade an ASYNC_READER transaction "
-                "to a WRITER mid-transaction")
-
-    def _reader(self, allow_async=False):
-        if self.mode is None:
-            self.mode = _READER
-        elif self.mode is _ASYNC_READER and not allow_async:
-            raise TypeError(
-                "Can't upgrade an ASYNC_READER transaction "
-                "to a READER mid-transaction")
-
-    def _async_reader(self):
-        if self.mode is None:
-            self.mode = _ASYNC_READER
-
 
 class _TransactionContextTLocal(threading.local):
     def __deepcopy__(self, memo):
@@ -818,8 +830,11 @@ class _TransactionContextTLocal(threading.local):
     def __reduce__(self):
         return _TransactionContextTLocal, ()
 
+from typing import TypeVar
+_ALLES = TypeVar("_ALLES", bound=Union["Connection", "Session", "AsyncConnection", "AsyncSession", None])
+_ES = TypeVar("_ES", bound=Union["Connection", "Session", None])
 
-class _TransactionContextManager:
+class _AbstractTransactionContextManager(Generic[_ALLES]):
     """Provide context-management and decorator patterns for transactions.
 
     This object integrates user-defined "context" objects with the
@@ -1009,22 +1024,22 @@ class _TransactionContextManager:
         return self.patch_factory(factory)
 
     @property
-    def replace(self):
+    def replace(self) -> Self:
         """Modifier to replace the global transaction factory with this one."""
         return self._clone(replace_global_factory=self._factory)
 
     @property
-    def writer(self):
+    def writer(self) -> Self:
         """Modifier to set the transaction to WRITER."""
         return self._clone(mode=_WRITER)
 
     @property
-    def reader(self):
+    def reader(self) -> Self:
         """Modifier to set the transaction to READER."""
         return self._clone(mode=_READER)
 
     @property
-    def allow_async(self):
+    def allow_async(self) -> Self:
         """Modifier to allow async operations
 
         Allows async operations if asynchronous session is already
@@ -1045,31 +1060,22 @@ class _TransactionContextManager:
         return self._clone(allow_async=True)
 
     @property
-    def independent(self):
+    def independent(self) -> Self:
         """Modifier to start a transaction independent from any enclosing."""
         return self._clone(independent=True)
 
     @property
-    def savepoint(self):
+    def savepoint(self) -> Self:
         """Modifier to start a SAVEPOINT if a transaction already exists."""
         return self._clone(savepoint=True)
 
     @property
-    def connection(self):
-        """Modifier to return a core Connection object instead of Session."""
-        return self._clone(connection=True)
-
-    @property
-    def async_(self):
+    def async_(self) -> Self:
         """Modifier to set a READER operation to ASYNC_READER."""
 
         if self._mode is _WRITER:
             raise TypeError("Setting async on a WRITER makes no sense")
         return self._clone(mode=_ASYNC_READER)
-
-    def using(self, context):
-        """Provide a context manager block that will use the given context."""
-        return self._transaction_scope(context)
 
     def __call__(self, fn):
         """Decorate a function."""
@@ -1091,7 +1097,7 @@ class _TransactionContextManager:
 
         return wrapper
 
-    def _clone(self, **kw):
+    def _clone(self, **kw) -> Any:
         default_kw = {
             "independent": self._independent,
             "mode": self._mode,
@@ -1100,36 +1106,7 @@ class _TransactionContextManager:
         default_kw.update(kw)
         return self.__class__(root=self._root, **default_kw)
 
-    @contextlib.contextmanager
-    def _transaction_scope(self, context):
-        transaction_contexts_by_thread = \
-            _transaction_contexts_by_thread(context)
-
-        current, restore = self._transaction_scope_impl(
-            transaction_contexts_by_thread
-        )
-
-        try:
-            if self._mode is not None:
-                with current._produce_block(
-                    mode=self._mode,
-                    connection=self._connection,
-                    savepoint=self._savepoint,
-                    allow_async=self._allow_async,
-                    context=context) as resource:
-                    yield resource
-            else:
-                yield
-        finally:
-            if restore is None:
-                del transaction_contexts_by_thread.current
-            elif current is not restore:
-                transaction_contexts_by_thread.current = restore
-
-    def _transaction_scope_impl(self, transaction_contexts_concurrent) -> Tuple[
-        _TransactionContext,
-        Optional[_TransactionContext]
-    ]:
+    def _transaction_scope_impl(self, transaction_contexts_concurrent) -> Any:
 
         new_transaction = self._independent
 
@@ -1157,6 +1134,46 @@ class _TransactionContextManager:
                 self._create_transaction_context(use_factory, global_factory=global_factory)
 
         return current, restore
+
+
+class _TransactionContextManager(_AbstractTransactionContextManager[_ES]):
+    @contextlib.contextmanager
+    def _transaction_scope(self, context) -> Any:
+        transaction_contexts_by_thread = \
+            _transaction_contexts_by_thread(context)
+
+        current, restore = self._transaction_scope_impl(
+            transaction_contexts_by_thread
+        )
+
+        try:
+            if self._mode is not None:
+                with current._produce_block(
+                    mode=self._mode,
+                    connection=self._connection,
+                    savepoint=self._savepoint,
+                    allow_async=self._allow_async,
+                    context=context) as resource:
+                    yield resource
+            else:
+                yield
+        finally:
+            if restore is None:
+                del transaction_contexts_by_thread.current
+            elif current is not restore:
+                transaction_contexts_by_thread.current = restore
+
+
+    @property
+    def connection(self) -> _TransactionContextManager[Connection]:
+        """Modifier to return a core Connection object instead of Session."""
+        return self._clone(connection=True)
+
+    def using(self, context) -> ContextManager[_ES]:
+        """Provide a context manager block that will use the given context."""
+        return self._transaction_scope(context)
+
+
 
 
 @property
@@ -1232,7 +1249,7 @@ def transaction_context_provider(klass):
     return klass
 
 
-_context_manager = _TransactionContextManager(_is_global_manager=True)
+_context_manager: _TransactionContextManager[Session] = _TransactionContextManager(_is_global_manager=True)
 """default context manager."""
 
 
