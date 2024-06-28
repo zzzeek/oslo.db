@@ -1,26 +1,33 @@
 from __future__ import annotations
 
-from .enginefacade import _AbstractTransactionFactory, _AbstractTransactionContextManager, _AbstractTransactionContext
-import contextvars
+import asyncio
 import contextlib
+import contextvars
+import itertools
 import logging
+from typing import AsyncContextManager
+from typing import AsyncIterator
+from typing import TYPE_CHECKING
+from typing import TypeVar
+from typing import Union
+
+from oslo_db import exception
+from oslo_db.sqlalchemy import engines
+from oslo_utils import excutils
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.util.concurrency import await_only
+from sqlalchemy.util.concurrency import greenlet_spawn
 
 from . import enginefacade as _sync_facade
-import asyncio
-from oslo_db import exception
-from oslo_db import options
-from oslo_db.sqlalchemy import engines
-from oslo_db.sqlalchemy import orm
-import itertools
-from oslo_db import warning
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
-from typing import TYPE_CHECKING, TypeVar, AsyncContextManager, AsyncIterator
-from typing import Optional, Tuple, NoReturn, Union
-from sqlalchemy.util.concurrency import await_only, greenlet_spawn
-from oslo_utils import excutils
+from .enginefacade import _AbstractTransactionContext
+from .enginefacade import _AbstractTransactionContextManager
+from .enginefacade import _AbstractTransactionFactory
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+    from sqlalchemy.ext.asyncio import AsyncConnection
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 _AES = TypeVar("_AES", bound=Union["AsyncConnection", "AsyncSession", None])
 

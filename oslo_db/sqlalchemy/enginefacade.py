@@ -17,33 +17,38 @@ import functools
 import inspect
 import operator
 import threading
+from typing import ContextManager
+from typing import Generic
+from typing import Protocol
+from typing import TYPE_CHECKING
+from typing import TypeVar
+from typing import Union
 import warnings
-from typing import TYPE_CHECKING, Iterator, overload, ContextManager
-from typing import Tuple, Optional, Protocol, Union, Generic, Literal
 
 import debtcollector.moves
 import debtcollector.removals
 import debtcollector.renames
 from oslo_config import cfg
-from oslo_utils import excutils
-
 from oslo_db import exception
 from oslo_db import options
+from oslo_db import warning
 from oslo_db.sqlalchemy import engines
 from oslo_db.sqlalchemy import orm
-from oslo_db import warning
+from oslo_utils import excutils
 
 
 if TYPE_CHECKING:
     from typing import Any
-    import asyncio
-    from sqlalchemy.engine import Engine, Connection
-    from sqlalchemy.orm import Session
-    from sqlalchemy.ext.asyncio import AsyncEngine
     from typing import Self
-    from sqlalchemy.orm import sessionmaker
+
+    from sqlalchemy.engine import Connection
+    from sqlalchemy.engine import Engine
     from sqlalchemy.ext.asyncio import async_sessionmaker
-    from sqlalchemy.ext.asyncio import AsyncSession, AsyncConnection
+    from sqlalchemy.ext.asyncio import AsyncConnection
+    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.orm import Session
+    from sqlalchemy.orm import sessionmaker
 
 class _FacadeSymbols(Enum):
     _ASYNC_READER = 1
@@ -829,8 +834,6 @@ class _TransactionContextTLocal(threading.local):
 
     def __reduce__(self):
         return _TransactionContextTLocal, ()
-
-from typing import TypeVar
 _ALLES = TypeVar("_ALLES", bound=Union["Connection", "Session", "AsyncConnection", "AsyncSession", None])
 _ES = TypeVar("_ES", bound=Union["Connection", "Session", None])
 
